@@ -1,12 +1,17 @@
 (() => {
+  if (window.__AI_DUP_GUARD_CONTENT_INIT__) return;
+  window.__AI_DUP_GUARD_CONTENT_INIT__ = true;
+
   const BRIDGE_CHANNEL = "__AI_DUP_GUARD_INJECT_FILES__";
+  const QUEUE_TTL_MS = 10000;
+  const GENERIC_CLIPBOARD_BASE_NAMES = new Set(["", "image", "resim", "clipboard", "pasted"]);
+  const MIME_PRIORITY = ["image/png", "image/webp", "image/jpeg", "image/gif", "image/bmp"];
 
   const activeDraftHashes = new Set();
   const activeDraftSizeTypeCounts = new Map();
   const pendingHashPromises = new Set();
   const pendingAttachmentQueue = [];
   const trackedPreviewElements = new Map();
-  const unconfirmedEntries = new Map();
 
   let lastPasteEditor = null;
 
@@ -15,7 +20,9 @@
 
   const removeSizeType = (key) => {
     const count = activeDraftSizeTypeCounts.get(key) || 0;
-    count <= 1 ? activeDraftSizeTypeCounts.delete(key) : activeDraftSizeTypeCounts.set(key, count - 1);
+    count <= 1
+      ? activeDraftSizeTypeCounts.delete(key)
+      : activeDraftSizeTypeCounts.set(key, count - 1);
   };
 
   const hasSizeType = (key) => (activeDraftSizeTypeCounts.get(key) || 0) > 0;
@@ -50,32 +57,13 @@
     setTimeout(() => toast.remove(), 2500);
   }
 
-  function clearUnconfirmedTimer(hash) {
-    const entry = unconfirmedEntries.get(hash);
-    if (entry) {
-      clearTimeout(entry.timerId);
-      unconfirmedEntries.delete(hash);
-    }
-  }
-
   function removeAttachmentEntry(meta) {
     if (!meta) return;
-    clearUnconfirmedTimer(meta.hash);
     activeDraftHashes.delete(meta.hash);
     removeSizeType(meta.sizeTypeKey);
   }
 
-  function rollbackUnconfirmedHash(hash) {
-    const entry = unconfirmedEntries.get(hash);
-    if (!entry) return;
-    removeAttachmentEntry({ hash, sizeTypeKey: entry.sizeTypeKey });
-    const qIdx = pendingAttachmentQueue.findIndex((item) => item.hash === hash);
-    if (qIdx !== -1) pendingAttachmentQueue.splice(qIdx, 1);
-  }
-
   function resetDraftState() {
-    for (const entry of unconfirmedEntries.values()) clearTimeout(entry.timerId);
-    unconfirmedEntries.clear();
     activeDraftHashes.clear();
     activeDraftSizeTypeCounts.clear();
     pendingHashPromises.clear();
@@ -89,29 +77,29 @@
     }
   }
 
-  function registerAttachment(hash, sizeTypeKey, { requireConfirmation = false } = {}) {
+  function registerAttachment(hash, sizeTypeKey) {
     activeDraftHashes.add(hash);
     addSizeType(sizeTypeKey);
     pruneExpiredQueue();
+    pendingAttachmentQueue.push({ hash, sizeTypeKey, expiresAt: Date.now() + QUEUE_TTL_MS });
+  }
 
-    pendingAttachmentQueue.push({ hash, sizeTypeKey, expiresAt: Date.now() + 3000 });
-    clearUnconfirmedTimer(hash);
-
-    if (requireConfirmation) {
-      const timerId = setTimeout(() => rollbackUnconfirmedHash(hash), 2000);
-      unconfirmedEntries.set(hash, { sizeTypeKey, timerId });
-    }
+  function resolveElement(target) {
+    const el = target instanceof Element ? target : target?.parentElement;
+    return el instanceof HTMLElement ? el : null;
   }
 
   function getActiveEditor() {
-    if (lastPasteEditor instanceof HTMLElement && document.contains(lastPasteEditor)) {
+    if (lastPasteEditor instanceof HTMLElement && lastPasteEditor.isConnected) {
       return lastPasteEditor;
     }
     const active = document.activeElement;
     if (active instanceof HTMLElement && (active.isContentEditable || active.tagName === "TEXTAREA")) {
       return active;
     }
-    const editors = document.querySelectorAll('rich-textarea [contenteditable="true"], [contenteditable="true"], textarea');
+    const editors = document.querySelectorAll(
+      'rich-textarea [contenteditable="true"], [contenteditable="true"], textarea'
+    );
     return editors.length > 0 ? editors[editors.length - 1] : null;
   }
 
@@ -123,7 +111,11 @@
     let bestContainer = editor.parentElement;
 
     for (let depth = 0; depth < 14 && node && node !== document.body; depth++) {
-      if (node.querySelector('[data-testid="user-message"], [data-message-author-role], message-content, .font-claude-response')) {
+      if (
+        node.querySelector(
+          '[data-testid="user-message"], [data-message-author-role], message-content, .font-claude-response'
+        )
+      ) {
         break;
       }
       bestContainer = node;
@@ -133,24 +125,50 @@
     return bestContainer;
   }
 
-  function getRemovableCardElement(mediaEl, composerRoot) {
+  function isPreviewMediaElement(el, composerRoot) {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.getAttribute("aria-hidden") === "true") return false;
+
+    if (el.tagName === "IMG") {
+      const src = (el.getAttribute("src") || "").trim();
+      if (!src) return false;
+      if (src.startsWith("blob:") || src.startsWith("data:image/")) return true;
+      return Boolean(composerRoot?.contains(el)) && /^https?:\/\//i.test(src);
+    }
+
+    const bg = el.style?.backgroundImage || "";
+    return bg.includes("blob:") || bg.includes("data:image/");
+  }
+
+  function countPreviewMediaInNode(container, composerRoot) {
+    let count = 0;
+    const nodes = container.querySelectorAll("img, [style*='blob:'], [style*='data:image/']");
+    for (const n of nodes) {
+      if (isPreviewMediaElement(n, composerRoot)) {
+        count++;
+        if (count > 1) return count;
+      }
+    }
+    return count;
+  }
+
+  // En fazla 4 seviye yukarı çıkar; editörü, birden fazla görseli veya araç çubuğunu asla seçmez
+  function getSafePreviewTarget(mediaEl, composerRoot) {
     if (!composerRoot) return mediaEl;
+    const editor = getActiveEditor();
     let node = mediaEl.parentElement;
-    while (node && node !== composerRoot && composerRoot.contains(node)) {
-      if (node.querySelector("button")) return node;
+
+    for (let depth = 0; depth < 4 && node && node !== composerRoot && composerRoot.contains(node); depth++) {
+      if (editor && node.contains(editor)) break;
+      if (countPreviewMediaInNode(node, composerRoot) > 1) break;
+
+      const buttons = node.querySelectorAll('button, [role="button"]');
+      if (buttons.length >= 1 && buttons.length <= 2) {
+        return node;
+      }
       node = node.parentElement;
     }
     return mediaEl;
-  }
-
-  function isPreviewMediaElement(el, composerRoot) {
-    if (!(el instanceof HTMLElement)) return false;
-    if (el.tagName === "IMG") {
-      const src = el.getAttribute("src") || "";
-      return src.startsWith("blob:") || src.startsWith("data:image/") || Boolean(composerRoot?.contains(el));
-    }
-    const bg = el.style?.backgroundImage || "";
-    return bg.includes("blob:") || bg.includes("data:image/");
   }
 
   function isAlreadyTracked(el) {
@@ -172,48 +190,84 @@
 
     const now = Date.now();
     for (const mediaEl of candidates) {
-      const cardEl = getRemovableCardElement(mediaEl, composerRoot);
-      if (isAlreadyTracked(cardEl)) continue;
+      const targetEl = getSafePreviewTarget(mediaEl, composerRoot);
+      if (isAlreadyTracked(targetEl)) continue;
 
       pruneExpiredQueue(now);
       if (pendingAttachmentQueue.length === 0) break;
 
       const meta = pendingAttachmentQueue.shift();
-      clearUnconfirmedTimer(meta.hash);
-      trackedPreviewElements.set(cardEl, { hash: meta.hash, sizeTypeKey: meta.sizeTypeKey });
+      trackedPreviewElements.set(targetEl, { hash: meta.hash, sizeTypeKey: meta.sizeTypeKey });
     }
   }
 
   function cleanupRemovedPreviews() {
     for (const [el, meta] of trackedPreviewElements.entries()) {
-      if (!document.contains(el)) {
+      if (!el.isConnected) {
         removeAttachmentEntry(meta);
         trackedPreviewElements.delete(el);
       }
     }
   }
 
+  function extractClipboardImages(clipboardData) {
+    const items = clipboardData?.items;
+    if (!items) return [];
+
+    const imageFiles = [];
+    for (const item of items) {
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) imageFiles.push(file);
+      }
+    }
+
+    if (imageFiles.length <= 1) return imageFiles;
+
+    // Tek görselin panoda birden fazla MIME formatıyla (png + bmp/jpeg) tutulmasını ayıkla
+    const distinctTypes = new Set(imageFiles.map((f) => f.type));
+    const allGenericNames = imageFiles.every((f) => {
+      const base = (f.name || "").replace(/\.[^.]+$/, "").trim().toLowerCase();
+      return GENERIC_CLIPBOARD_BASE_NAMES.has(base);
+    });
+
+    if (allGenericNames && distinctTypes.size === imageFiles.length) {
+      imageFiles.sort((a, b) => {
+        const ia = MIME_PRIORITY.indexOf(a.type);
+        const ib = MIME_PRIORITY.indexOf(b.type);
+        return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+      });
+      return [imageFiles[0]];
+    }
+
+    return imageFiles;
+  }
+
   function ensureUniqueFilenameForGemini(file) {
     if (location.hostname !== "gemini.google.com") return file;
     const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
     const uniqueName = `ss_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.${ext}`;
-    return new File([file], uniqueName, { type: file.type, lastModified: file.lastModified || Date.now() });
+    return new File([file], uniqueName, {
+      type: file.type,
+      lastModified: file.lastModified || Date.now()
+    });
   }
 
-  async function injectFilesViaMainWorld(files, trackedHashes) {
+  function injectFilesViaMainWorld(files) {
     const preparedFiles = files.map(ensureUniqueFilenameForGemini);
+    const mode = location.hostname === "gemini.google.com" ? "drop" : "paste";
+    window.postMessage({ type: BRIDGE_CHANNEL, mode, files: preparedFiles }, window.location.origin);
+  }
 
-    if (location.hostname === "gemini.google.com") {
-      window.postMessage({ type: BRIDGE_CHANNEL, mode: "drop", files: preparedFiles }, "*");
-      return;
-    }
-
-    window.postMessage({ type: BRIDGE_CHANNEL, mode: "paste", files: preparedFiles }, "*");
-    await new Promise((resolve) => setTimeout(resolve, 400));
-
-    if (trackedHashes.some((h) => unconfirmedEntries.has(h))) {
-      window.postMessage({ type: BRIDGE_CHANNEL, mode: "drop", files: preparedFiles }, "*");
-    }
+  function isRemoveButtonLabel(label) {
+    return (
+      label.includes("remove") ||
+      label.includes("delete") ||
+      label.includes("kaldır") ||
+      label.includes("sil") ||
+      label.includes("close") ||
+      label.includes("kapat")
+    );
   }
 
   document.addEventListener(
@@ -221,20 +275,14 @@
     (event) => {
       if (event.__aiDupGuardFromBridge || event.wrappedJSObject?.__aiDupGuardFromBridge) return;
 
-      if (event.target instanceof HTMLElement) {
-        lastPasteEditor = event.target.closest('[contenteditable="true"], textarea') || event.target;
+      const targetEl = resolveElement(event.target);
+      if (targetEl) {
+        lastPasteEditor =
+          targetEl.closest('rich-textarea [contenteditable="true"], [contenteditable="true"], textarea') ||
+          targetEl;
       }
 
-      const items = event.clipboardData?.items;
-      if (!items) return;
-
-      const imageFiles = [];
-      for (const item of items) {
-        if (item.kind === "file" && item.type.startsWith("image/")) {
-          const file = item.getAsFile();
-          if (file) imageFiles.push(file);
-        }
-      }
+      const imageFiles = extractClipboardImages(event.clipboardData);
       if (imageFiles.length === 0) return;
 
       const isGeminiWithExistingImage =
@@ -252,7 +300,7 @@
         for (const file of imageFiles) {
           const sizeTypeKey = `${file.size}:${file.type}`;
           const hashTask = computeSha256(file)
-            .then((hash) => registerAttachment(hash, sizeTypeKey, { requireConfirmation: false }))
+            .then((hash) => registerAttachment(hash, sizeTypeKey))
             .finally(() => pendingHashPromises.delete(hashTask));
           pendingHashPromises.add(hashTask);
         }
@@ -268,21 +316,19 @@
         }
 
         const uniqueFiles = [];
-        const uniqueHashes = [];
         for (const file of imageFiles) {
           const hash = await computeSha256(file);
           if (activeDraftHashes.has(hash)) {
             showToast("Bu görsel zaten mevcut mesaja eklendi.");
           } else {
             const sizeTypeKey = `${file.size}:${file.type}`;
-            registerAttachment(hash, sizeTypeKey, { requireConfirmation: true });
+            registerAttachment(hash, sizeTypeKey);
             uniqueFiles.push(file);
-            uniqueHashes.push(hash);
           }
         }
 
         if (uniqueFiles.length > 0) {
-          await injectFilesViaMainWorld(uniqueFiles, uniqueHashes);
+          injectFilesViaMainWorld(uniqueFiles);
         }
       })();
     },
@@ -330,8 +376,8 @@
     "keydown",
     (e) => {
       if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
-        const target = e.target;
-        if (target instanceof HTMLElement && (target.isContentEditable || target.tagName === "TEXTAREA")) {
+        const targetEl = resolveElement(e.target);
+        if (targetEl && targetEl.closest('[contenteditable="true"], textarea')) {
           resetDraftState();
         }
       }
@@ -342,16 +388,9 @@
   document.addEventListener(
     "click",
     (e) => {
-      const btn = e.target.closest("button");
+      const targetEl = resolveElement(e.target);
+      const btn = targetEl?.closest('button, [role="button"]');
       if (!btn) return;
-
-      for (const [cardEl, meta] of trackedPreviewElements.entries()) {
-        if (cardEl.contains(btn)) {
-          removeAttachmentEntry(meta);
-          trackedPreviewElements.delete(cardEl);
-          return;
-        }
-      }
 
       const label = (
         btn.getAttribute("aria-label") ||
@@ -361,14 +400,20 @@
         ""
       ).toLowerCase();
 
-      if (
-        activeDraftHashes.size === 1 &&
-        (label.includes("remove") || label.includes("delete") || label.includes("kaldır") || label.includes("sil"))
-      ) {
-        if (getComposerRoot()?.contains(btn)) {
-          resetDraftState();
+      for (const [cardEl, meta] of trackedPreviewElements.entries()) {
+        if (cardEl.contains(btn) && isRemoveButtonLabel(label)) {
+          removeAttachmentEntry(meta);
+          trackedPreviewElements.delete(cardEl);
           return;
         }
+      }
+
+      const composerRoot = getComposerRoot();
+      if (composerRoot && !composerRoot.contains(btn)) return;
+
+      if (activeDraftHashes.size === 1 && isRemoveButtonLabel(label)) {
+        resetDraftState();
+        return;
       }
 
       if (label.includes("send") || label.includes("gönder") || label.includes("submit")) {

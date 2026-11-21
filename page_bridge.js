@@ -1,4 +1,7 @@
 (() => {
+  if (window.__AI_DUP_GUARD_BRIDGE_INIT__) return;
+  window.__AI_DUP_GUARD_BRIDGE_INIT__ = true;
+
   const BRIDGE_CHANNEL = "__AI_DUP_GUARD_INJECT_FILES__";
 
   function findEditorTarget() {
@@ -49,7 +52,7 @@
   }
 
   window.addEventListener("message", (event) => {
-    if (event.source !== window) return;
+    if (event.source !== window || event.origin !== window.location.origin) return;
     const data = event.data;
     if (!data || data.type !== BRIDGE_CHANNEL || !Array.isArray(data.files)) return;
 
