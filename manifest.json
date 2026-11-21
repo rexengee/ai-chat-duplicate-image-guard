@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AI Chat Duplicate Image Guard",
   "version": "1.1.1",
-  "description": "Gemini, ChatGPT ve Claude sohbetlerinde aynı mesaja aynı görselin ikinci kez yapıştırılmasını engeller.",
+  "description": "Prevents accidentally pasting the same image twice into the same message draft on Gemini, ChatGPT, and Claude.",
   "icons": {
     "48": "icon.svg",
     "96": "icon.svg"
